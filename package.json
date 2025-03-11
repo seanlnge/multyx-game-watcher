@@ -1,5 +1,5 @@
 {
-  "name": "multyxgamewatcher",
+  "name": "lambda",
   "version": "1.0.0",
   "main": "index.js",
   "scripts": {
@@ -9,9 +9,8 @@
   "license": "ISC",
   "description": "",
   "dependencies": {
-    "@aws-sdk/client-auto-scaling": "^3.758.0",
-    "@aws-sdk/client-ec2": "^3.758.0",
-    "dotenv": "^16.4.7",
-    "express": "^4.21.2"
+    "@aws-sdk/client-sfn": "^3.758.0",
+    "postgres": "^3.4.5",
+    "redis": "^4.7.0"
   }
 }

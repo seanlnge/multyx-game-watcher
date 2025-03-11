@@ -1,115 +1,106 @@
-const express = require('express');
-const { EC2Client, DescribeInstancesCommand } = require('@aws-sdk/client-ec2');
-const { AutoScalingClient, DescribeAutoScalingGroupsCommand } = require('@aws-sdk/client-auto-scaling');
-require('dotenv').config();
+const { createClient } = require("redis");
+const { SFNClient, StartExecutionCommand } = require("@aws-sdk/client-sfn");
+const postgres = require("postgres");
 
-const app = express();
-const port = process.env.PORT || 3008;
-
-// Configure AWS region (update as needed)
-const AWSConfig = {
-    region: 'us-east-2',
+const stepFunctionClient = new SFNClient({
+    region: "us-east-2",
     credentials: {
-        accessKeyId: process.env.ACCESS_KEY,
-        secretAccessKey: process.env.SECRET_KEY
+        accessKeyId: env.ACCESS_KEY,
+        secretAccessKey: env.SECRET_KEY
     }
-};
+});
 
-const ec2 = new EC2Client(AWSConfig);
-const autoscaling = new AutoScalingClient(AWSConfig);
+const client = createClient({
+    username: process.env.REDIS_USERNAME,
+    password: process.env.REDIS_PASSWORD,
+    socket: {
+        host: process.env.REDIS_HOST,
+        port: parseInt(process.env.REDIS_PORT)
+    }
+}).on('error', err => console.log('Redis Client Error', err));
 
-// Each entry will be { instanceId, availableCpu, availableMemory, totalCpu, totalMemory }
-const InstanceCache = [];
+async function ConnectRedis() {
+    if(client.isReady) return;
+    await client.connect();
+}
 
-async function updateInstanceCache() {
-    try {
-        // Retrieve instances from your Auto Scaling Group
-        const asgData = await autoscaling.send(new DescribeAutoScalingGroupsCommand({
-            AutoScalingGroupNames: [process.env.ASG]
-        }));
+const sql = postgres(env.DATABASE_URL);
 
-        const newInstanceIds = [];
-        if(asgData.AutoScalingGroups && asgData.AutoScalingGroups.length > 0) {
-            asgData.AutoScalingGroups.forEach(asg => {
-                asg.Instances.forEach(inst => {
-                    if (inst.LifecycleState === 'InService') {
-                        if(!InstanceCache.find(x => x.id == inst.InstanceId)) {
-                            newInstanceIds.push(inst.InstanceId);
-                        }
-                    }
-                });
-            });
+const CalculateTokensPerHour = (vCPU, gbRAM) => {
+    const vcpuTPH = parseFloat(vCPU) * 3.279724529;
+    const gbramTPH = parseFloat(gbRAM) * 0.3601377355;
+    return vcpuTPH + gbramTPH;
+}
+
+function Terminate(spaceId, arn) {
+    const sfnInput = { spaceId, arn, operation: "deleting" };
+
+    return stepFunctionClient.send(new StartExecutionCommand({
+        stateMachineArn: env.UNDEPLOY_SFN_ARN,
+        input: JSON.stringify(sfnInput)
+    }));
+}
+
+exports.handler = async () => {
+    await ConnectRedis();
+
+    const msSinceLastMonitor = Date.now() - parseInt(await client.get("lastMonitorTime"));
+    await client.set("lastMonitorTime", Date.now());
+    const hoursUsed = msSinceLastMonitor / (60 * 60 * 1000);
+
+    const keys = await client.keys("space:*");
+
+    const withdrawTokenMap = new Map();
+
+    for(const key of keys) {
+        const spaceId = parseInt(key.split("space:")[1]);
+        if(isNaN(spaceId)) continue;
+
+        const space = await client.hGetAll(key);
+        
+        const terminationMillis = 60 * 1000 * parseInt(space.terminationMinutes);
+        const millisInactive = Date.now() - parseInt(space.inactiveSince);
+        if(parseInt(space.players) == 0 && terminationMillis > 0 && millisInactive > terminationMillis) {
+            console.log(millisInactive);
+            Terminate(spaceId, space.arn);
         }
         
-        InstanceCache.push(...newInstanceIds.map(instanceId => ({
-            id: instanceId,
-            freeMemory: 2048, // assuming c7a.medium instanceType
-            freeCPU: 1,       // assuming c7a.medium instanceType
-        })));
+        const tokensUsed = parseFloat(await client.hGet(key, "tokensUsed"));
+        const withdrawTokens = hoursUsed * CalculateTokensPerHour(space.vcpu, space.gbram);
+        if(isNaN(withdrawTokens)) continue;
 
-        console.log("Updated instance cache:", InstanceCache);
-    } catch (err) {
-        console.error("Error updating instance cache:", err);
+        await client.hSet(key, "tokensUsed", tokensUsed + withdrawTokens);
+        withdrawTokenMap.set(spaceId, { tokenAmount: withdrawTokens, arn: space.arn });
     }
-}
 
-// Update the cache immediately, then every minute (60000ms)
-updateInstanceCache();
-setInterval(updateInstanceCache, 60000);
-
-
-function AllocateInstance(cpu, memory) {
-    for(const instance of InstanceCache) {
-        if(instance.freeCPU > cpu && instance.freeMemory > memory) {
-            instance.freeCPU -= cpu;
-            instance.freeMemory -= memory;
-            return instance.id;
+    // Withdraw deploy tokens from all users
+    for(let [spaceId, { tokenAmount, arn }] of withdrawTokenMap.entries()) {
+        const [user] = await sql`
+            SELECT deploy_tokens
+            FROM multyxsite_creator
+            WHERE id = (
+                SELECT created_by
+                FROM multyxsite_deployment
+                WHERE space_id = ${spaceId}
+                LIMIT 1
+            )
+        `;
+        if(user.deploy_tokens < tokenAmount) {
+            Terminate(spaceId, arn);
+            tokenAmount = user.deploy_tokens;
         }
+
+        await sql`
+            UPDATE multyxsite_creator
+            SET deploy_tokens = deploy_tokens - (${tokenAmount}::real)
+            WHERE id = (
+                SELECT created_by
+                FROM multyxsite_deployment
+                WHERE space_id = ${spaceId}
+                LIMIT 1
+            )
+        `;
     }
 }
 
-function DeallocateInstance(instanceId, cpu, memory) {
-    const instance = InstanceCache.find(x => x.id == instanceId);
-    instance.freeCpu += cpu;
-    instance.freeMemory += memory;
-    return instance;
-}
-
-app.get('/allocate_instance', (req, res) => {
-    const requiredCpu = parseFloat(req.query.requiredCpu);
-    const requiredMemory = parseFloat(req.query.requiredMemory);
-
-    if(isNaN(requiredCpu) || isNaN(requiredMemory)) {
-        return res.status(400).json({ error: 'Invalid or missing resource requirements.' });
-    }
-
-    const instanceId = AllocateInstance(requiredCpu, requiredMemory);
-
-    if(instanceId) {
-        res.json(instanceId);
-    } else {
-        res.status(500).json({ error: 'Could not find available instance' });
-    }
-});
-
-app.get('/deallocate_instance', (req, res) => {
-    const cpu = parseFloat(req.query.cpu);
-    const memory = parseFloat(req.query.memory);
-    const instanceId = req.query.instanceId;
-
-    if(isNaN(requiredCpu) || isNaN(requiredMemory)) {
-        return res.status(400).json({ error: 'Invalid or missing resource requirements.' });
-    }
-
-    const resp = DeallocateInstance(instanceId, cpu, memory);
-
-    if(resp) {
-        res.status(200);
-    } else {
-        res.status(500).json({ error: 'Could not find available instance' });
-    }
-});
-
-app.listen(port, () => {
-    console.log(`Game watcher service is running at http://localhost:${port}`);
-});
+exports.handler();
